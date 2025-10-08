@@ -1,3 +1,4 @@
+// --- 외부 라이브러리 관련 ---
 use axum::{
     extract::State,
     routing::{get, post},
@@ -7,16 +8,86 @@ use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use once_cell::sync::Lazy;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use spki::{AlgorithmIdentifierRef, ObjectIdentifier, SubjectPublicKeyInfoRef};
-use std::{collections::HashMap, net::SocketAddr, sync::Mutex};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
-use rsa::signature::Verifier;
-// 트레이트 임포트(반드시 필요)
-use der::Decode;            // for SubjectPublicKeyInfoRef::from_der
-use spki::DecodePublicKey;  // for from_public_key_der on p256/rsa types
 
-// ---- 인메모리 세션 스토어 ----
+// 암호화 및 서명 검증 관련
+use rsa::signature::Verifier;
+use sha2::{Digest, Sha256};
+use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
+use spki::DecodePublicKey;  // p256, rsa 처럼 public key DER decoding용
+use pkcs8::spki::SubjectPublicKeyInfo;
+use der::{Any, Decode};  // der decoding 및 trait
+use hex;
+
+// PEM 인코딩 관련
+use pem_rfc7468 as pem;
+
+// --- 표준 라이브러리 ---
+use std::{
+    collections::HashMap,
+    fs,
+    net::SocketAddr,
+    sync::Mutex,
+};
+
+static USERS: Lazy<Mutex<HashMap<String, UserKey>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+
+
+#[derive(Clone)]
+struct UserKey {
+    spki_der: Vec<u8>,
+    fpr: [u8; 32],
+}
+
+fn spki_fpr_sha256(spki_der: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(spki_der);
+    h.finalize().into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddResult {
+    Inserted,  // 신규 추가
+    Replaced,  // 기존 키 교체
+}
+
+fn add_user_key(user_id: &str, spki_der: Vec<u8>) -> (AddResult, [u8; 32]) {
+    let fpr = spki_fpr_sha256(&spki_der);
+    let mut m = USERS.lock().unwrap();
+    let prev = m.insert(user_id.to_string(), UserKey { spki_der, fpr });
+    let outcome = if prev.is_none() { AddResult::Inserted } else { AddResult::Replaced };
+    (outcome, fpr)
+}
+
+
+fn spki_der_from_pubkey_pem(pem_bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let (label, der_bytes) = pem::decode_vec(pem_bytes).map_err(|e| format!("pem decode: {e}"))?;
+    if label != "PUBLIC KEY" {
+        return Err(format!("unsupported PEM label: {label}"));
+    }
+    // 검증: SPKI 형태인지 확인
+    let _ = SubjectPublicKeyInfo::<Any, String>::from_der(&der_bytes)
+        .map_err(|e| format!("spki from_der: {e}"))?;
+    Ok(der_bytes)
+}
+
+fn register_from_pubkey_pem(user_id: &str, path: &str) -> Result<(AddResult, String), String> {
+    let pem_bytes = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+    let spki_der  = spki_der_from_pubkey_pem(&pem_bytes)?;
+    let (res, fpr) = add_user_key(user_id, spki_der);
+    Ok((res, hex::encode(fpr)))
+}
+
+
+fn get_user_key(user_id: &str) -> Option<UserKey> {
+    USERS.lock().unwrap().get(user_id).cloned()
+}
+
+
+
+//현재 DPF에는 session 개념이 없으므로 기존 ID/PASSWORD에 추가해서 DB화 할것.
 static STORE: Lazy<Mutex<HashMap<String, SessionRec>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Debug)]
@@ -42,7 +113,7 @@ struct ChallengeResp {
 #[derive(Deserialize)]
 struct VerifyReq {
     session_id: String,
-    public_key_der_b64: String, // SPKI DER (클라의 RetrievePublicKeyWithBlobType 결과)
+    user_id: String,
     signature_b64: String,       // RequestSignAsync 결과 바이트
 }
 
@@ -59,6 +130,16 @@ async fn main() {
         .route("/auth/challenge", post(issue_challenge))
         .route("/auth/verify", post(verify_signature))
         .with_state(()); // 빈 스테이트
+
+    // Add key: DB에 추가할것.
+    println!("Register pubkey");
+    match register_from_pubkey_pem("sample_id", "ex.pem") {
+        Ok((res, fpr_hex)) => match res {
+            AddResult::Inserted => println!("등록 성공 신규 추가 지문 {}", fpr_hex),
+            AddResult::Replaced => println!("등록 성공 기존 키 교체 지문 {}", fpr_hex),
+        },
+        Err(e) => eprintln!("등록 실패 {}", e),
+    }
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     println!("listening on http://{}", addr);
@@ -98,132 +179,46 @@ async fn issue_challenge(
 }
 
 // 2) 서명 검증
+// 저장된 공개키로만 검증(P-256 + SHA-256)
+fn verify_with_stored_p256(user_key: &UserKey, msg: &[u8], sig_der: &[u8]) -> Result<(), String> {
+    let vk = VerifyingKey::from_public_key_der(&user_key.spki_der)
+        .map_err(|e| format!("load spki: {e}"))?;
+    let sig = P256Signature::from_der(sig_der)
+        .map_err(|_| "bad ECDSA DER signature".to_string())?;
+    vk.verify(msg, &sig).map_err(|_| "ECDSA verify failed".to_string())
+}
+
 async fn verify_signature(
     State(_): State<()>,
     Json(req): Json<VerifyReq>,
 ) -> Json<VerifyResp> {
-    // 세션 로드(1회성)
+    // 1 세션 로드
     let rec = {
         let mut m = STORE.lock().unwrap();
         match m.remove(&req.session_id) {
             Some(r) => r,
-            None => {
-                return Json(VerifyResp {
-                    ok: false,
-                    error: Some("invalid session".into()),
-                })
-            }
+            None => return Json(VerifyResp { ok: false, error: Some("invalid session".into()) }),
         }
     };
     if rec.expires_at < OffsetDateTime::now_utc() {
-        return Json(VerifyResp {
-            ok: false,
-            error: Some("session expired".into()),
-        });
+        return Json(VerifyResp { ok: false, error: Some("session expired".into()) });
     }
 
-    // 입력 파싱
-    let spki_der = match B64.decode(req.public_key_der_b64.as_bytes()) {
-        Ok(v) => v,
-        Err(_) => {
-            return Json(VerifyResp {
-                ok: false,
-                error: Some("bad public_key_der_b64".into()),
-            })
-        }
+    // 2 사용자 공개키 로드
+    let user_key = match get_user_key(&req.user_id) {
+        Some(k) => k,
+        None => return Json(VerifyResp { ok: false, error: Some("unknown user".into()) }),
     };
+
+    // 3 서명 파싱
     let sig = match B64.decode(req.signature_b64.as_bytes()) {
         Ok(v) => v,
-        Err(_) => {
-            return Json(VerifyResp {
-                ok: false,
-                error: Some("bad signature_b64".into()),
-            })
-        }
+        Err(_) => return Json(VerifyResp { ok: false, error: Some("bad signature_b64".into()) }),
     };
 
-    // 검증
-    match verify_spki_signature(&spki_der, &rec.challenge, &sig) {
+    // 4 저장된 공개키로만 검증
+    match verify_with_stored_p256(&user_key, &rec.challenge, &sig) {
         Ok(()) => Json(VerifyResp { ok: true, error: None }),
-        Err(e) => Json(VerifyResp {
-            ok: false,
-            error: Some(e),
-        }),
+        Err(e) => Json(VerifyResp { ok: false, error: Some(e) }),
     }
-}
-
-// ---- 서명 검증 로직 (RustCrypto) ----
-fn verify_spki_signature(spki_der: &[u8], msg: &[u8], sig_bytes: &[u8]) -> Result<(), String> {
-    // SPKI 파싱
-    let spki = SubjectPublicKeyInfoRef::from_der(spki_der)
-        .map_err(|e| format!("SPKI parse error: {e}"))?;
-    let alg: AlgorithmIdentifierRef<'_> = spki.algorithm;
-
-    // 알고리즘 식별자 OID
-    const OID_ID_EC_PUBLIC_KEY: &str = "1.2.840.10045.2.1";
-    const OID_SECP256R1: &str = "1.2.840.10045.3.1.7";
-    const OID_RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
-    const OID_RSASSA_PSS: &str = "1.2.840.113549.1.1.10";
-
-    let oid = alg.oid;
-
-    // 1) ECDSA P-256 + SHA-256
-    if oid == ObjectIdentifier::new_unwrap(OID_ID_EC_PUBLIC_KEY) {
-        // curve OID 확인 (parameters는 AnyRef이므로 OID로 변환)
-        let params = alg.parameters.ok_or("EC params missing")?;
-        let curve_oid =
-            ObjectIdentifier::try_from(params).map_err(|_| "EC params not an OID")?;
-        if curve_oid == ObjectIdentifier::new_unwrap(OID_SECP256R1) {
-            use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
-            use p256::PublicKey;
-
-            // 전체 SPKI DER로부터 P-256 공개키 로드 (DecodePublicKey 필요)
-            let pkey =
-                PublicKey::from_public_key_der(spki_der).map_err(|e| format!("p256 load: {e}"))?;
-            let vk = VerifyingKey::from(pkey);
-
-            // Windows Hello 서명은 보통 DER(r,s)
-            let sig = P256Signature::from_der(sig_bytes)
-                .map_err(|_| "expecting ECDSA DER signature (r,s)")?;
-            vk.verify(msg, &sig)
-                .map_err(|_| "ECDSA verify failed".to_string())?;
-            return Ok(());
-        }
-        return Err("Unsupported EC curve (expect secp256r1)".into());
-    }
-
-    // 2) RSA PKCS#1 v1.5 + SHA-256
-    if oid == ObjectIdentifier::new_unwrap(OID_RSA_ENCRYPTION) {
-        use rsa::pkcs1v15::{Signature as RsaPkcs1Sig, VerifyingKey};
-        use rsa::RsaPublicKey;
-        use sha2::Sha256;
-
-        // SPKI DER에서 RSA 공개키 로드 (DecodePublicKey 필요)
-        let rsa_pub =
-            RsaPublicKey::from_public_key_der(spki_der).map_err(|e| format!("RSA load: {e}"))?;
-        let vk = VerifyingKey::<Sha256>::new(rsa_pub);
-
-        let sig = RsaPkcs1Sig::try_from(sig_bytes).map_err(|_| "bad RSA PKCS#1 v1.5 sig")?;
-        vk.verify(msg, &sig)
-            .map_err(|_| "RSA PKCS#1 v1.5 verify failed".to_string())?;
-        return Ok(());
-    }
-
-    // 3) RSA-PSS + SHA-256
-    if oid == ObjectIdentifier::new_unwrap(OID_RSASSA_PSS) {
-        use rsa::pss::{Signature as RsaPssSig, VerifyingKey};
-        use rsa::RsaPublicKey;
-        use sha2::Sha256;
-
-        let rsa_pub =
-            RsaPublicKey::from_public_key_der(spki_der).map_err(|e| format!("RSA load: {e}"))?;
-        let vk = VerifyingKey::<Sha256>::new(rsa_pub);
-
-        let sig = RsaPssSig::try_from(sig_bytes).map_err(|_| "bad RSA-PSS sig")?;
-        vk.verify(msg, &sig)
-            .map_err(|_| "RSA-PSS verify failed".to_string())?;
-        return Ok(());
-    }
-
-    Err("Unsupported key algorithm OID".into())
 }
