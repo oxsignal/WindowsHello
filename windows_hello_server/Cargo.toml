@@ -8,9 +8,12 @@ actix-web = "4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-rand = "0.8" # 챌린지 생성을 위한 난수
+rand = "0.8"
 base64 = { version = "0.21", features = ["std"] } # Base64 처리
 
-# 서명 검증을 위한 암호화 라이브러리 (클라이언트와 동일)
+# For verifying sign
 rsa = "0.9"
 sha2 = { version = "0.10", features = ["oid"] }
+
+# Parsing x509 cert
+x509-parser = "0.15" 
